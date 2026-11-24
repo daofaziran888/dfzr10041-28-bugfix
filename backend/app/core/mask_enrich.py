@@ -7,7 +7,9 @@ from __future__ import annotations
 
 from app.core.models import (
     EventRecord, FieldEnrichRule, MaskMethod, MaskResult, MaskRule,
+    SeverityEvidence,
 )
+from app.core.severity import SeverityService
 
 # ---------- 预置脱敏规则 ----------
 
@@ -94,13 +96,16 @@ class MaskEnrichPipeline:
     """
 
     def __init__(self, mask_rules: list[MaskRule] | None = None,
-                 enrich_rules: list[FieldEnrichRule] | None = None):
+                 enrich_rules: list[FieldEnrichRule] | None = None,
+                 severity_service: SeverityService | None = None):
         if mask_rules is None:
             mask_rules = PRESET_MASK_RULES
         if enrich_rules is None:
             enrich_rules = PRESET_ENRICH_RULES
         self.mask_rules = mask_rules
         self.enrich_rules = enrich_rules
+        # 独立级别判定服务：负责生成单事件 SeverityDecision，模板默认值由它做版本快照。
+        self.severity_service = severity_service or SeverityService()
         self._mask_results: list[MaskResult] = []
 
     # ---------- 数据流 3: event_store → mask_rule → field_enrich → event_type ----------
@@ -154,16 +159,18 @@ class MaskEnrichPipeline:
         return enriched
 
     def process_records(self, records: list[EventRecord]) -> list[EventRecord]:
-        """批量处理事件记录：依次执行脱敏和字段增强。
+        """批量处理事件记录：依次执行脱敏、字段增强和独立级别判定。
 
         这是 event_store → mask_rule → field_enrich → event_type 的完整实现。
+        级别增强只写入单事件的 SeverityDecision，绝不修改 event_type 模板默认值；
+        已确认评级的事件重复核验时保持冻结。
         """
         for record in records:
             # 1. mask_rule: 脱敏变换
             self.apply_all_masks(record)
             # 2. field_enrich: 字段增强
             self.apply_all_enrichments(record)
-            # 3. event_type: 增强后重新评估严重级别
+            # 3. 独立级别判定：生成/重算单事件级别，模板默认值保持不变
             self._update_severity(record)
         return records
 
@@ -215,15 +222,56 @@ class MaskEnrichPipeline:
     def get_mask_results(self) -> list[MaskResult]:
         return list(self._mask_results)
 
-    def _update_severity(self, record: EventRecord):
-        """根据增强后的字段更新事件记录的严重级别。"""
-        enhanced_severity = record.enriched_fields.get("severity_level", "")
-        if enhanced_severity == "HIGH":
-            record.event_type.severity = "HIGH"
-        elif enhanced_severity == "MEDIUM":
-            record.event_type.severity = "MEDIUM"
-        elif enhanced_severity == "TRACE":
-            record.event_type.severity = "DEBUG"
+    def _collect_severity_evidence(self, record: EventRecord) -> list[SeverityEvidence]:
+        """收集本事件命中的全部级别增强依据（含未批准规则），逐份保留原字段。
+
+        同一事件命中多条级别增强规则时所有依据都留存；
+        是否参与正式判定交给 SeverityService 按 approved 与优先级处理，
+        同优先级互斥级别由判定层阻止，不能按登记顺序覆盖。
+        """
+        evidences: list[SeverityEvidence] = []
+        for rule in sorted(self.enrich_rules, key=lambda r: (r.priority, r.rule_id)):
+            if rule.target_field != "severity_level":
+                continue
+            source_value = (
+                record.parsed_fields.get(rule.enrich_source)
+                or record.masked_fields.get(rule.enrich_source) or ""
+            )
+            if not source_value:
+                continue
+            mapped = rule.enrich(record.parsed_fields)
+            if mapped.upper() not in ("TRACE", "DEBUG", "LOW", "INFO", "MEDIUM", "HIGH"):
+                continue
+            evidences.append(SeverityEvidence(
+                rule_id=rule.rule_id,
+                target_field=rule.target_field,
+                source_field=rule.enrich_source,
+                source_value=source_value,
+                severity=mapped.upper(),
+                priority=rule.priority,
+                approved=rule.approved,
+                template_version=record.event_type.template_version,
+            ))
+        return evidences
+
+    def _update_severity(self, record: EventRecord) -> None:
+        """根据增强字段生成单事件独立级别判定（不回写事件类型模板）。
+
+        旧实现直接改写 record.event_type.severity，导致一条事件增强为 HIGH
+        会污染整个事件类型的默认严重级别、同类型其他事件候选串位。现改为：
+        - 模板默认级别只作为只读快照进入 SeverityDecision；
+        - 评级结果存放在 record.severity_decision，类型模板 severity 保持原值；
+        - 已正式确认的评级重复核验时冻结，不被重复增强覆盖。
+        """
+        service = self.severity_service
+        type_id = record.event_type.type_id
+        if service.active_template(type_id) is None:
+            service.register_template(
+                type_id, record.event_type.template_version,
+                record.event_type.severity,
+            )
+        evidences = self._collect_severity_evidence(record)
+        service.compute_decision(record, evidences)
 
 
 def make_mask_enrich_pipeline() -> MaskEnrichPipeline:

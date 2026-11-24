@@ -16,6 +16,7 @@ from app.core.models import (
     LogEntry, LogFormat, LogSourceConfig, ParseResultStatus, ParseRule,
     QualityReport,
 )
+from app.core.severity import AlertCheck, SeverityService
 
 # ---------- 预置日志来源配置 ----------
 
@@ -378,16 +379,58 @@ class IngestPipeline:
     # ---------- 数据流 5: event_type → anomaly_rule → forward_rule ----------
 
     def check_anomaly(self, records: list[EventRecord], event_type_id: str,
-                       threshold: int) -> list[EventRecord]:
-        """异常检测：统计指定事件类型数量，触发告警条件。
+                       threshold: int, level: str | None = None,
+                       severity_service: SeverityService | None = None
+                       ) -> list[EventRecord]:
+        """异常检测：统计指定事件类型的真实候选数量，触发告警条件。
 
         对应 anomaly_rule 模块：事件分类→异常告警路径。
+
+        - level 为空（兼容旧调用）：按事件类型筛选并以阈值标记；
+        - level="HIGH"：高警只选独立判定为已确认 HIGH 且无争议的事件；
+        - level="MEDIUM"：普通复查选独立判定 MEDIUM 及以上的事件。
+        候选数 > threshold 才触发，避免事件等级串位把 B 错算成高警候选。
         """
-        matched = [r for r in records if r.event_type.type_id == event_type_id]
+        if level is None:
+            matched = [r for r in records if r.event_type.type_id == event_type_id]
+            if len(matched) > threshold:
+                for r in matched:
+                    r.parsed_fields["anomaly_alert"] = "triggered"
+            return matched
+
+        if severity_service is None:
+            raise ValueError(
+                "按级别筛选告警必须传入已生成 SeverityDecision 的 SeverityService，"
+                "避免临时实例读不到独立级别判定而漏选/串位",
+            )
+        typed = [r for r in records if r.event_type.type_id == event_type_id]
+        matched = severity_service.select_candidates(typed, level)
         if len(matched) > threshold:
             for r in matched:
-                r.parsed_fields["anomaly_alert"] = "triggered"
+                r.parsed_fields["anomaly_alert"] = f"triggered:{level.upper()}"
         return matched
+
+    def run_severity_review(
+        self,
+        records: list[EventRecord],
+        check: AlertCheck,
+        target: str,
+        severity_service: SeverityService,
+        *,
+        mask_enrich_pipeline=None,
+        template_version: str | None = None,
+    ):
+        """串联入口：process_records（独立级别判定）→ check_anomaly（告警筛选）。
+
+        先跑脱敏/增强管道生成单事件 SeverityDecision（模板默认值不被回写），
+        再按规则档位选真实候选并核对数量，返回带幂等投递状态的复查结果。
+        """
+        if mask_enrich_pipeline is not None:
+            mask_enrich_pipeline.process_records(records)
+        # 候选筛选与数量核对与 check_anomaly 同读 SeverityDecision，口径一致
+        return severity_service.run_review(
+            records, check, target, template_version=template_version,
+        )
 
     def apply_forward_rules(self, records: list[EventRecord],
                              target: str) -> list[dict[str, Any]]:

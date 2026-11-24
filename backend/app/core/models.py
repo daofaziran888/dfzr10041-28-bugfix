@@ -36,6 +36,36 @@ class MaskMethod(Enum):
     CUSTOM_REGEX = "custom_regex"
 
 
+class SeverityLevel(Enum):
+    """事件严重级别枚举——按严重程度排序的独立评级。
+
+    评级只作用于单条事件的独立级别判定（SeverityDecision），
+    不允许回写 EventTypeDef.severity（类型模板默认值）。
+    """
+    TRACE = "TRACE"
+    DEBUG = "DEBUG"
+    LOW = "LOW"
+    INFO = "INFO"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+
+
+# 严重级别排序：数值越大越严重；LOW 与模板默认 INFO 同档。
+SEVERITY_RANK: dict[str, int] = {
+    "TRACE": 0,
+    "DEBUG": 10,
+    "LOW": 20,
+    "INFO": 20,
+    "MEDIUM": 30,
+    "HIGH": 40,
+}
+
+
+def severity_rank(level: str) -> int:
+    """返回严重级别排序值，未知级别按最低档处理。"""
+    return SEVERITY_RANK.get((level or "").upper(), 0)
+
+
 @dataclass
 class LogSourceConfig:
     """日志来源配置模型——对应 log_source 模块。"""
@@ -194,11 +224,61 @@ class FieldEnrichRule:
     mapping_dict: dict[str, str]
     default_value: str = "unknown"
     priority: int = 0
+    # 只有已批准的级别增强规则才能进入独立级别判定；未批准的仍可写字段，不产生评级依据。
+    approved: bool = True
 
     def enrich(self, fields: dict[str, str]) -> str:
         """根据映射字典增强目标字段。"""
         key = fields.get(self.enrich_source, "").strip()
         return self.mapping_dict.get(key, self.default_value)
+
+
+@dataclass
+class SeverityEvidence:
+    """单条级别增强依据——一份字段证据，多规则命中时全部保留。
+
+    保留增强前的原字段与增强后的级别、规则优先级，使争议事件可凭两份原字段追溯，
+    不依赖登记顺序，也不覆盖彼此。
+    """
+    rule_id: str
+    target_field: str
+    source_field: str
+    source_value: str          # 增强前的原字段值（依据）
+    severity: str              # 增强映射出的级别
+    priority: int
+    approved: bool = True
+    template_version: str = ""
+
+
+@dataclass
+class SeverityDecision:
+    """单条事件的独立级别判定数据——与事件类型模板默认值完全隔离。
+
+    - default_level：判定时采用的类型模板默认级别（来自某一模板版本快照）
+    - effective_level：本次实际评级；有争议且未确认时回落到模板默认级别
+    - confirmed：值班者是否已正式确认；确认后评级冻结，重复核验/更正不再改动
+    - blocked：同优先级增强规则给出互斥级别（如 HIGH 与 TRACE），阻止进入正式高警
+    """
+    default_level: str = "INFO"
+    effective_level: str = "INFO"
+    template_version: str = ""
+    evidences: list[SeverityEvidence] = field(default_factory=list)
+    conflicts: list[str] = field(default_factory=list)
+    blocked: bool = False
+    confirmed: bool = False
+    confirmed_by: str = ""
+    confirmed_level: str = ""
+
+    def is_high(self) -> bool:
+        """是否为可进入正式高警的 HIGH 评级（争议事件被阻止）。"""
+        return not self.blocked and self.confirmed and self.confirmed_level == "HIGH"
+
+    def is_medium_or_above(self) -> bool:
+        """是否达到普通复查门槛 MEDIUM 及以上（争议事件被阻止）。"""
+        if self.blocked:
+            return False
+        level = self.confirmed_level if self.confirmed else self.effective_level
+        return severity_rank(level) >= severity_rank("MEDIUM")
 
 
 @dataclass
@@ -211,6 +291,8 @@ class EventTypeDef:
     alert_threshold: int = 0
     sample_ratio: float = 1.0
     retain_days: int = 30
+    # 模板版本标识：默认值被管理员调整时升版，独立判定只引用快照，不回写该对象。
+    template_version: str = "v1"
 
 
 @dataclass
@@ -226,6 +308,11 @@ class EventRecord:
     source_host: str
     store_partition: str = ""
     index_state: str = "已写入"
+    # 独立级别判定数据：单事件专属，绝不共享、绝不回写 event_type 模板。
+    severity_decision: SeverityDecision | None = None
+    # 复查领取状态：已领取但未正式确认期间，模板默认值变更需按版本优先级处理。
+    review_claimed: bool = False
+    review_claimed_by: str = ""
 
 
 @dataclass
